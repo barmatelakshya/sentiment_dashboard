@@ -6,14 +6,13 @@ from datetime import datetime, timezone
 from collections import deque
 from typing import List, Optional
 
+import httpx
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
-from transformers import pipeline
 from pydantic import BaseModel, Field, ConfigDict
 import feedparser
 from dotenv import load_dotenv
-import torch
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
@@ -26,10 +25,9 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 mongo_client = AsyncIOMotorClient(os.getenv("MONGO_URL", "mongodb://localhost:27017"))
 db = mongo_client[os.getenv("DB_NAME", "sentiment_db")]
 
-# ML Model
-device = 0 if torch.cuda.is_available() else "cpu"
-sentiment_analyzer = None
-
+# HuggingFace Inference API
+HF_API_URL = "https://api-inference.huggingface.co/models/cardiffnlp/twitter-roberta-base-sentiment-latest"
+HF_TOKEN = os.getenv("HF_TOKEN", "")
 LABEL_MAP = {"LABEL_0": "negative", "LABEL_1": "neutral", "LABEL_2": "positive"}
 
 RSS_FEEDS = [
@@ -125,9 +123,15 @@ manager = ConnectionManager()
 
 # --- Sentiment ---
 def analyze(text: str) -> dict:
-    result = sentiment_analyzer(text[:512])[0]
-    label = LABEL_MAP.get(result["label"], result["label"].lower())
-    return {"sentiment": label, "score": round(result["score"], 3)}
+    headers = {"Authorization": f"Bearer {HF_TOKEN}"} if HF_TOKEN else {}
+    try:
+        r = httpx.post(HF_API_URL, json={"inputs": text[:512]}, headers=headers, timeout=15)
+        result = r.json()[0][0]
+        label = LABEL_MAP.get(result["label"], "neutral")
+        return {"sentiment": label, "score": round(result["score"], 3)}
+    except Exception as e:
+        logger.error(f"HF API error: {e}")
+        return {"sentiment": "neutral", "score": 0.5}
 
 
 # --- Background Task ---
@@ -185,14 +189,7 @@ async def compute_trends() -> dict:
 # --- Startup ---
 @app.on_event("startup")
 async def startup():
-    global sentiment_analyzer
-    logger.info("Loading model...")
-    sentiment_analyzer = pipeline(
-        "sentiment-analysis",
-        model="cardiffnlp/twitter-roberta-base-sentiment-latest",
-        device=device
-    )
-    logger.info("Model loaded.")
+    logger.info("Starting up...")
     await db.sentiments.create_index([("timestamp", -1)])
     await db.sentiments.create_index([("sentiment", 1), ("timestamp", -1)])
     asyncio.create_task(fetch_loop())
